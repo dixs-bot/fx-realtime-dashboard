@@ -1,5 +1,6 @@
 source "https://rubygems.org"
 
-gem "sinatra"
-gem "puma"
-gem "httparty"
+gem "sinatra", "~> 4.2"
+gem "puma", "~> 6.0"
+gem "rackup", "~> 2.1"
+gem "httparty", "~> 0.21"
