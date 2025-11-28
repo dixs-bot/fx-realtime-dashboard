@@ -7,7 +7,7 @@ require 'uri'
 require 'base64'
 
 set :bind, '0.0.0.0'
-set :port, 4567
+set :port, ENV.fetch('PORT', 4567)
 set :public_folder, File.dirname(__FILE__) + '/public'
 
 FileUtils.mkdir_p(File.join(settings.public_folder, 'uploads'))
