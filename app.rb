@@ -8,7 +8,9 @@ require "uri"
 set :bind, "0.0.0.0"
 set :port, 4567
 
+TWELVE_KEY = ENV["TWELVEDATA_KEY"]
 OPENAI_KEY = ENV["OPENAI_API_KEY"]
+
 # ====================== HELPERS ==========================
 helpers do
   # Ambil data candle dari TwelveData
@@ -26,6 +28,7 @@ helpers do
     uri.query = URI.encode_www_form(params)
 
     res = Net::HTTP.get_response(uri)
+    puts "TWELVEDATA HTTP #{res.code}"
     return [] unless res.is_a?(Net::HTTPSuccess)
 
     body = JSON.parse(res.body) rescue nil
@@ -783,14 +786,28 @@ get "/" do
 
       <button class="btn" onclick="ambilSignal()">⚡ REFRESH SIGNAL</button>
 
+      <button class="btn"
+        style="margin-top:6px;background:linear-gradient(90deg,#00ff88,#00d49b);border:1px solid #00ffcc;box-shadow:0 0 12px rgba(0,255,180,.6);padding:8px;font-size:11px;"
+        onclick="toggleAutoRefresh()">
+        🔄 AUTO REFRESH: <span id="autoState">OFF</span>
+      </button>
+
       <div style="margin-top:8px;display:flex;justify-content:space-between;align-items:center;">
         <div>
-          <div class="label">PRICE</div>
-          <div class="value mono" id="lastPrice">-</div>
+          <div class="label">INTERVAL</div>
+          <select id="intervalSelect" class="input-small" style="border-radius:999px;">
+            <option value="5000">5 detik</option>
+            <option value="10000" selected>10 detik</option>
+            <option value="30000">30 detik</option>
+            <option value="60000">1 menit</option>
+          </select>
         </div>
         <div style="text-align:right;">
-          <div class="label">SIGNAL</div>
-          <span id="signalPill" class="pill pill-wait">WAIT</span>
+          <div class="label">PRICE</div>
+          <div class="value mono" id="lastPrice">-</div>
+          <div style="margin-top:4px;">
+            <span id="signalPill" class="pill pill-wait">WAIT</span>
+          </div>
         </div>
       </div>
     </div>
@@ -968,6 +985,8 @@ get "/" do
 
     <script>
       let lastSnapshot = null;
+      let autoMode = false;
+      let autoTimer = null;
 
       async function ambilSignal() {
         const pair = document.getElementById("pairSelect").value;
@@ -986,6 +1005,7 @@ get "/" do
           const pill = document.getElementById("signalPill");
           pill.textContent = sig;
           pill.className = "pill " + (sig === "BUY" ? "pill-buy" : (sig === "SELL" ? "pill-sell" : "pill-wait"));
+
           const ind = data.indicators || {};
           document.getElementById("rsiVal").innerText = ind.rsi ? ind.rsi.toFixed(1) : "-";
           document.getElementById("atrVal").innerText = ind.atr ? ind.atr.toFixed(5) : "-";
@@ -1138,6 +1158,34 @@ get "/" do
           " dan jika payout " + payout.toFixed(0) + "% maka profit sekitar " +
           profitWin.toFixed(2) + " jika posisi menang. Gunakan ini untuk latihan risk management di akun demo, bukan jaminan hasil.";
       }
+
+      function toggleAutoRefresh() {
+        autoMode = !autoMode;
+        const state = document.getElementById("autoState");
+        const interval = parseInt(document.getElementById("intervalSelect").value);
+
+        if (autoMode) {
+          state.textContent = "ON";
+          state.style.color = "#00ffcc";
+          autoTimer = setInterval(() => {
+            ambilSignal();
+          }, interval);
+        } else {
+          state.textContent = "OFF";
+          state.style.color = "#ff3355";
+          clearInterval(autoTimer);
+        }
+      }
+
+      document.getElementById("intervalSelect").addEventListener("change", () => {
+        if (autoMode) {
+          clearInterval(autoTimer);
+          const newInterval = parseInt(document.getElementById("intervalSelect").value);
+          autoTimer = setInterval(() => {
+            ambilSignal();
+          }, newInterval);
+        }
+      });
 
       // auto load pertama
       ambilSignal();
