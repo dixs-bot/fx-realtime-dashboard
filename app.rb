@@ -8,9 +8,7 @@ require "uri"
 set :bind, "0.0.0.0"
 set :port, 4567
 
-TWELVE_KEY = ENV["TWELVEDATA_KEY"]
 OPENAI_KEY = ENV["OPENAI_API_KEY"]
-
 # ====================== HELPERS ==========================
 helpers do
   # Ambil data candle dari TwelveData
@@ -987,8 +985,7 @@ get "/" do
           const sig = data.signal || "WAIT";
           const pill = document.getElementById("signalPill");
           pill.textContent = sig;
-          pill.className = "pill " + (sig === "BUY" ? "pill-buy" : sig === "SELL" ? "pill-sell" : "pill-wait");
-
+          pill.className = "pill " + (sig === "BUY" ? "pill-buy" : (sig === "SELL" ? "pill-sell" : "pill-wait"));
           const ind = data.indicators || {};
           document.getElementById("rsiVal").innerText = ind.rsi ? ind.rsi.toFixed(1) : "-";
           document.getElementById("atrVal").innerText = ind.atr ? ind.atr.toFixed(5) : "-";
