@@ -1,1391 +1,1149 @@
-require 'sinatra'
-require 'json'
-require 'httparty'
-require 'fileutils'
-require 'securerandom'
-require 'uri'
-require 'base64'
+# app.rb
+require "sinatra"
+require "net/http"
+require "json"
+require "time"
+require "uri"
 
-# Bisa jalan di Termux (4567) & Railway/VPS (pakai ENV PORT)
-set :bind, '0.0.0.0'
-set :port, ENV.fetch('PORT', 4567)
-set :public_folder, File.dirname(__FILE__) + '/public'
+set :bind, "0.0.0.0"
+set :port, 4567
 
-FileUtils.mkdir_p(File.join(settings.public_folder, 'uploads'))
+TWELVE_KEY = ENV["TWELVEDATA_KEY"]
+OPENAI_KEY = ENV["OPENAI_API_KEY"]
 
-# ======== KONFIG API ========
-TD_API_KEY      = ENV['TWELVEDATA_KEY']
-OPENAI_API_KEY  = ENV['OPENAI_API_KEY']
-OPENAI_API_URL  = 'https://api.openai.com/v1/responses'
-TD_BASE_URL     = 'https://api.twelvedata.com'
-
-PAIRS = {
-  "EURUSD" => { name: "EUR/USD", symbol: "EUR/USD" },
-  "GBPUSD" => { name: "GBP/USD", symbol: "GBP/USD" },
-  "USDJPY" => { name: "USD/JPY", symbol: "USD/JPY" }
-}
-
+# ====================== HELPERS ==========================
 helpers do
-  # ====== DATA FOREX DARI TWELVEDATA ======
-  def fetch_pair_intraday_1m_twelve(pair_code)
-    raise "TWELVEDATA_KEY belum diset" if TD_API_KEY.nil? || TD_API_KEY.empty?
+  # Ambil data candle dari TwelveData
+  def fetch_candles(pair_code = "EUR/USD", interval = "1min", limit = 200)
+    return [] unless TWELVE_KEY
 
-    cfg = PAIRS[pair_code] || PAIRS["EURUSD"]
+    uri = URI("https://api.twelvedata.com/time_series")
     params = {
-      symbol:     cfg[:symbol],
-      interval:   '1min',
-      outputsize: 200,
-      apikey:     TD_API_KEY
+      symbol: pair_code,
+      interval: interval,
+      outputsize: limit,
+      format: "JSON",
+      apikey: TWELVE_KEY
     }
+    uri.query = URI.encode_www_form(params)
 
-    res  = HTTParty.get("#{TD_BASE_URL}/time_series", query: params)
-    json = JSON.parse(res.body)
+    res = Net::HTTP.get_response(uri)
+    return [] unless res.is_a?(Net::HTTPSuccess)
 
-    if json["status"] == "error"
-      raise "Error TwelveData: #{json["message"]}"
-    end
+    body = JSON.parse(res.body) rescue nil
+    return [] unless body && body["values"]
 
-    values = json["values"]
-    raise "Data candle kosong" if values.nil? || values.empty?
-
-    values.map do |v|
+    body["values"].map do |row|
       {
-        time:  v["datetime"],
-        open:  v["open"].to_f,
-        high:  v["high"].to_f,
-        low:   v["low"].to_f,
-        close: v["close"].to_f
+        time:  Time.parse(row["datetime"]),
+        open:  row["open"].to_f,
+        high:  row["high"].to_f,
+        low:   row["low"].to_f,
+        close: row["close"].to_f
       }
-    end.reverse
+    end.reverse # urut dari lama ke terbaru
   end
 
-  # ====== INDIKATOR DASAR ======
-  def sma(values, period)
-    return nil if values.size < period
-    values.last(period).sum.to_f / period
+  # ========= Indikator dasar =========
+  def sma(values, length)
+    return nil if values.size < length
+    values.last(length).sum / length.to_f
   end
 
-  def rsi(values, period = 14)
-    return nil if values.size < period + 1
-    gains, losses = [], []
-    values.each_cons(2) do |prev, curr|
-      diff = curr - prev
-      diff >= 0 ? gains << diff : losses << -diff
+  def rsi(values, length = 14)
+    return nil if values.size < length + 1
+    gains = []
+    losses = []
+    values.each_cons(2) do |a, b|
+      change = b - a
+      if change >= 0
+        gains << change
+      else
+        losses << change.abs
+      end
     end
-    avg_gain = gains.last(period).sum.to_f / period
-    avg_loss = losses.last(period).sum.to_f / period
-    return 50.0 if avg_loss == 0
+    avg_gain = gains.last(length).sum / length.to_f
+    avg_loss = losses.last(length).sum / length.to_f
+    return 50.0 if avg_loss.zero?
+
     rs = avg_gain / avg_loss
     100 - (100 / (1 + rs))
   end
 
-  def decide_signal(sfast, sslow, rsi)
-    return "hold" if [sfast, sslow, rsi].any?(&:nil?)
-    return "buy"  if sfast > sslow && rsi < 70
-    return "sell" if sfast < sslow && rsi > 30
-    "hold"
-  end
-
-  # ====== ATR (Average True Range) ======
-  def atr(candles, period = 14)
-    return nil if candles.size < period + 1
-
+  def atr(candles, length = 14)
+    return nil if candles.size < length + 1
     trs = []
-    candles.each_cons(2) do |prev, curr|
-      tr1 = curr[:high] - curr[:low]
-      tr2 = (curr[:high] - prev[:close]).abs
-      tr3 = (curr[:low]  - prev[:close]).abs
-      trs << [tr1, tr2, tr3].max
+    (1...candles.size).each do |i|
+      h = candles[i][:high]
+      l = candles[i][:low]
+      pc = candles[i - 1][:close]
+      tr = [h - l, (h - pc).abs, (l - pc).abs].max
+      trs << tr
     end
-
-    return nil if trs.size < period
-    trs.last(period).sum.to_f / period
+    trs.last(length).sum / length.to_f
   end
 
-  # ====== Bollinger Bands (20,2 default) ======
-  def bollinger(closes, period = 20, k = 2.0)
-    return { middle: nil, upper: nil, lower: nil } if closes.size < period
-
-    window = closes.last(period)
-    m = window.sum.to_f / period
-    var = window.map { |c| (c - m) ** 2 }.sum / period
-    sd = Math.sqrt(var)
-
+  def bollinger_band(values, length = 20, mult = 2.0)
+    return nil if values.size < length
+    slice = values.last(length)
+    mean = slice.sum / length.to_f
+    variance = slice.map { |v| (v - mean) ** 2 }.sum / length.to_f
+    stddev = Math.sqrt(variance)
     {
-      middle: m,
-      upper:  m + k * sd,
-      lower:  m - k * sd
+      middle: mean,
+      upper:  mean + mult * stddev,
+      lower:  mean - mult * stddev
     }
   end
 
-  # ====== DETEKSI POLA CANDLE ======
-  def detect_candle_pattern(candles)
+  # ========= Market Structure HH / HL / LH / LL =========
+  def detect_market_structure(candles, sens = 2)
     return {
-      name: "Belum cukup data",
-      direction: "neutral",
-      confidence: 0.0,
-      note: "Minimal butuh 3 candle terakhir untuk deteksi pola."
-    } if candles.size < 3
+      trend: "unknown",
+      bias: "neutral",
+      points: [],
+      swings: [],
+      comment: "Belum cukup data untuk membaca struktur market."
+    } if candles.size < sens * 2 + 5
 
-    c1 = candles[-3]
-    c2 = candles[-2]
-    c3 = candles[-1]
+    swings = []
 
-    body = ->(c) { (c[:close] - c[:open]).abs }
-    range = ->(c) { c[:high] - c[:low] }
-    is_bull = ->(c) { c[:close] > c[:open] }
-    is_bear = ->(c) { c[:close] < c[:open] }
+    (sens...(candles.size - sens)).each do |i|
+      c = candles[i]
+      left = candles[i - sens]
+      right = candles[i + sens]
 
-    b1, b2, b3 = body[c1], body[c2], body[c3]
-    r3 = range[c3]
+      # swing high
+      if c[:high] > left[:high] && c[:high] > right[:high]
+        swings << {
+          type:  "swing_high",
+          time:  c[:time],
+          price: c[:high].to_f,
+          index: i
+        }
+      end
 
-    uptrend   = c3[:close] > c1[:close]
-    downtrend = c3[:close] < c1[:close]
-
-    # Doji
-    if r3 > 0 && b3 < (r3 * 0.15)
-      return {
-        name: "Doji",
-        direction: "neutral",
-        confidence: 0.6,
-        note: "Doji = keraguan market. Latihan: tunggu candle konfirmasi (break high/low doji) sebelum entry."
-      }
+      # swing low
+      if c[:low] < left[:low] && c[:low] < right[:low]
+        swings << {
+          type:  "swing_low",
+          time:  c[:time],
+          price: c[:low].to_f,
+          index: i
+        }
+      end
     end
 
+    swings.sort_by! { |s| s[:index] }
+
+    points = []
+    last_high = nil
+    last_low  = nil
+
+    swings.each do |s|
+      if s[:type] == "swing_high"
+        label =
+          if last_high.nil?
+            "H"
+          else
+            s[:price].to_f > last_high[:price].to_f ? "HH" : "LH"
+          end
+        last_high = s
+      else
+        label =
+          if last_low.nil?
+            "L"
+          else
+            s[:price].to_f > last_low[:price].to_f ? "HL" : "LL"
+          end
+        last_low = s
+      end
+
+      points << s.merge(label: label)
+    end
+
+    recent_labels = points.last(8).map { |p| p[:label] }
+
+    up_count   = recent_labels.count("HH") + recent_labels.count("HL")
+    down_count = recent_labels.count("LH") + recent_labels.count("LL")
+
+    trend =
+      if up_count >= 4 && up_count > down_count
+        "uptrend"
+      elsif down_count >= 4 && down_count > up_count
+        "downtrend"
+      else
+        "sideways"
+      end
+
+    bias, comment =
+      case trend
+      when "uptrend"
+        [
+          "buy_bias",
+          "Struktur market didominasi HH & HL (uptrend). Latihan: fokus cari peluang BUY setelah koreksi ke area support/SNR, jangan kejar SELL melawan trend."
+        ]
+      when "downtrend"
+        [
+          "sell_bias",
+          "Struktur market didominasi LH & LL (downtrend). Latihan: fokus cari peluang SELL di area resistance/pullback lemah, hindari BUY melawan arus."
+        ]
+      else
+        [
+          "neutral",
+          "Struktur market cenderung sideways. Latihan: perhatikan batas atas–bawah range, jangan agresif entry di tengah."
+        ]
+      end
+
+    {
+      trend: trend,
+      bias: bias,
+      points: points,
+      swings: swings,
+      comment: comment
+    }
+  end
+
+  # ========= SNR dari swing label =========
+  def build_snr_from_structure(structure)
+    points = structure[:points]
+    return [] if points.nil? || points.empty?
+
+    key = points.last(6)
+    key.map do |p|
+      {
+        type:  p[:label],
+        price: p[:price].to_f,
+        time:  p[:time]
+      }
+    end
+  end
+
+  # ========= Break of Structure (BOS) =========
+  def detect_bos(structure)
+    points = structure[:points]
+    return {
+      status: "none",
+      direction: "none",
+      label: nil,
+      price: nil,
+      time: nil,
+      note: "Belum ada swing signifikan untuk membaca BOS."
+    } if points.nil? || points.empty?
+
+    last = points.last
+
+    case last[:label]
+    when "HH"
+      {
+        status: "bos_up",
+        direction: "up",
+        label: last[:label],
+        price: last[:price].to_f,
+        time:  last[:time],
+        note:  "Harga membentuk Higher High baru → indikasi break struktur ke atas (bullish BOS). Latihan: perhatikan peluang BUY setelah koreksi wajar."
+      }
+    when "LL"
+      {
+        status: "bos_down",
+        direction: "down",
+        label: last[:label],
+        price: last[:price].to_f,
+        time:  last[:time],
+        note:  "Harga membentuk Lower Low baru → indikasi break struktur ke bawah (bearish BOS). Latihan: perhatikan peluang SELL setelah pullback lemah."
+      }
+    else
+      {
+        status: "none",
+        direction: "none",
+        label: last[:label],
+        price: last[:price].to_f,
+        time:  last[:time],
+        note:  "Swing terakhir belum HH atau LL. Belum ada BOS jelas, tunggu struktur berikutnya."
+      }
+    end
+  end
+
+  # ========= Deteksi Pola Candlestick (Engulfing, Pin Bar) =========
+  def detect_candle_pattern(candles)
+    return {
+      name: "Tidak ada pola kuat",
+      direction: "neutral",
+      confidence: 0.0,
+      note: "Belum terbentuk pola candlestick yang kuat untuk latihan entry."
+    } if candles.size < 3
+
+    c0 = candles[-1] # terakhir
+    c1 = candles[-2] # sebelumnya
+
+    body0 = (c0[:close] - c0[:open]).abs
+    body1 = (c1[:close] - c1[:open]).abs
+
+    bull0 = c0[:close] > c0[:open]
+    bear0 = c0[:close] < c0[:open]
+    bull1 = c1[:close] > c1[:open]
+    bear1 = c1[:close] < c1[:open]
+
     # Bullish Engulfing
-    if is_bear[c2] && is_bull[c3] &&
-       c3[:open] <= c2[:close] && c3[:close] >= c2[:open] &&
-       b3 > b2 * 1.2
+    if bull0 && bear1 &&
+       c0[:close] >= [c1[:close], c1[:open]].max &&
+       c0[:open]  <= [c1[:close], c1[:open]].min &&
+       body0 > body1 * 1.1
       return {
         name: "Bullish Engulfing",
         direction: "bullish",
-        confidence: uptrend ? 0.8 : 0.65,
-        note: "Bullish Engulfing – buyer ambil alih dari seller. Praktik: fokus BUY searah trend naik setelah koreksi kecil."
+        confidence: 0.8,
+        note: "Bullish engulfing di akhir penurunan → potensi pembalikan naik. Latihan: perhatikan konfirmasi di candle berikutnya & posisi relatif terhadap SNR."
       }
     end
 
     # Bearish Engulfing
-    if is_bull[c2] && is_bear[c3] &&
-       c3[:open] >= c2[:close] && c3[:close] <= c2[:open] &&
-       b3 > b2 * 1.2
+    if bear0 && bull1 &&
+       c0[:close] <= [c1[:close], c1[:open]].min &&
+       c0[:open]  >= [c1[:close], c1[:open]].max &&
+       body0 > body1 * 1.1
       return {
         name: "Bearish Engulfing",
         direction: "bearish",
-        confidence: downtrend ? 0.8 : 0.65,
-        note: "Bearish Engulfing – seller ambil alih dari buyer. Praktik: fokus SELL di arah trend turun setelah pullback."
+        confidence: 0.8,
+        note: "Bearish engulfing di akhir kenaikan → potensi pembalikan turun. Latihan: lihat respon harga di SNR / area premium sebelum entry."
       }
     end
 
-    # Pin bar / Hammer / Shooting Star
-    upper_wick = c3[:high] - [c3[:open], c3[:close]].max
-    lower_wick = [c3[:open], c3[:close]].min - c3[:low]
-
-    if lower_wick > b3 * 1.5 && upper_wick < b3 * 0.5
+    # Bullish Pin Bar (lower wick panjang)
+    lower_wick = c0[:open] < c0[:close] ? (c0[:open] - c0[:low]).abs : (c0[:close] - c0[:low]).abs
+    upper_wick = c0[:high] - [c0[:open], c0[:close]].max
+    if lower_wick > body0 * 2.0 && lower_wick > upper_wick * 1.5
       return {
-        name: "Bullish Pin Bar (Hammer)",
+        name: "Bullish Pin Bar",
         direction: "bullish",
-        confidence: 0.7,
-        note: "Bullish pin bar – penolakan harga bawah. Praktik: cari ini di area support dalam konteks trend naik."
+        confidence: 0.6,
+        note: "Bullish pin bar (ekor bawah panjang) → penolakan harga dari bawah. Latihan: gunakan sebagai konfirmasi BUY dekat support/SNR, bukan di tengah range."
       }
     end
 
-    if upper_wick > b3 * 1.5 && lower_wick < b3 * 0.5
+    # Bearish Pin Bar (upper wick panjang)
+    upper_wick2 = c0[:high] - [c0[:open], c0[:close]].max
+    lower_wick2 = [c0[:open], c0[:close]].min - c0[:low]
+    if upper_wick2 > body0 * 2.0 && upper_wick2 > lower_wick2 * 1.5
       return {
-        name: "Bearish Pin Bar (Shooting Star)",
+        name: "Bearish Pin Bar",
         direction: "bearish",
-        confidence: 0.7,
-        note: "Bearish pin bar – penolakan harga atas. Praktik: cari ini di area resistance dalam trend turun."
+        confidence: 0.6,
+        note: "Bearish pin bar (ekor atas panjang) → penolakan harga dari atas. Latihan: jadikan sinyal SELL di dekat resistance/SNR, hindari SELL di support."
       }
     end
 
     {
       name: "Tidak ada pola kuat",
       direction: "neutral",
-      confidence: 0.4,
-      note: "Belum terlihat pola jelas. Fokus dulu baca trend & struktur high-low sebelum entry."
+      confidence: 0.0,
+      note: "Belum ada pola engulfing / pin bar yang jelas. Latihan: fokus dulu pada struktur (trend, BOS, SNR) sebelum mengandalkan candlestick."
     }
   end
 
-  # ====== AUTO SUPPORT & RESISTANCE (SNR) ======
-  def find_snr_levels(candles, sensitivity = 2)
-    return { resistance: [], support: [] } if candles.size < (sensitivity * 2 + 3)
+  # ========= AI Confluence =========
+  def build_confluence(trend_signal, structure, bos, indicators, pattern)
+    score = 50.0
+    reasons = []
 
-    swing_highs = []
-    swing_lows  = []
+    # arah dasar dari MA
+    if trend_signal == "BUY"
+      score += 8
+      reasons << "SMA cepat di atas SMA lambat → bias BUY."
+    elsif trend_signal == "SELL"
+      score -= 8
+      reasons << "SMA cepat di bawah SMA lambat → bias SELL."
+    else
+      reasons << "SMA belum jelas → WAIT."
+    end
 
-    (sensitivity...candles.size - sensitivity).each do |i|
-      c = candles[i]
+    # trend struktur
+    case structure[:trend]
+    when "uptrend"
+      score += 10
+      reasons << "Struktur HH & HL dominan (uptrend)."
+    when "downtrend"
+      score -= 10
+      reasons << "Struktur LH & LL dominan (downtrend)."
+    else
+      reasons << "Struktur sideways, perlu ekstra hati-hati."
+    end
 
-      if c[:high] > candles[i - sensitivity][:high] &&
-         c[:high] > candles[i + sensitivity][:high]
-        swing_highs << c[:high]
-      end
+    # BOS
+    if bos[:status] == "bos_up"
+      score += 7
+      reasons << "Terjadi BOS ke atas (Higher High baru)."
+    elsif bos[:status] == "bos_down"
+      score -= 7
+      reasons << "Terjadi BOS ke bawah (Lower Low baru)."
+    end
 
-      if c[:low] < candles[i - sensitivity][:low] &&
-         c[:low] < candles[i + sensitivity][:low]
-        swing_lows << c[:low]
+    rsi_val = indicators[:rsi]
+    if rsi_val
+      if rsi_val > 55
+        score += 4
+        reasons << "RSI di atas 55 → momentum cenderung bullish."
+      elsif rsi_val < 45
+        score -= 4
+        reasons << "RSI di bawah 45 → momentum cenderung bearish."
+      else
+        reasons << "RSI di area tengah → momentum moderat."
       end
     end
 
-    highs = swing_highs.group_by { |v| v.round(4) }
-                       .sort_by { |k,v| -v.size }
-                       .map(&:first)
-                       .first(5)
+    if indicators[:bb]
+      price = indicators[:price] || 0.0
+      mid   = indicators[:bb][:middle]
+      if price > mid
+        score += 2
+        reasons << "Harga berada di atas mid BB (cenderung sisi atas)."
+      elsif price < mid
+        score -= 2
+        reasons << "Harga berada di bawah mid BB (cenderung sisi bawah)."
+      end
+    end
 
-    lows  = swing_lows.group_by  { |v| v.round(4) }
-                      .sort_by { |k,v| -v.size }
-                      .map(&:first)
-                      .first(5)
+    case pattern[:direction]
+    when "bullish"
+      score += (pattern[:confidence] * 10.0)
+      reasons << "Pola candlestick bullish terdeteksi (#{pattern[:name]})."
+    when "bearish"
+      score -= (pattern[:confidence] * 10.0)
+      reasons << "Pola candlestick bearish terdeteksi (#{pattern[:name]})."
+    end
 
-    { resistance: highs, support: lows }
-  end
-end
+    score = [[score, 0].max, 100].min
 
-# ======== API SIGNAL (JSON) ========
-get "/signal" do
-  content_type :json
-  begin
-    pair_code = (params["pair"] || "EURUSD").upcase
-    cfg       = PAIRS[pair_code] || PAIRS["EURUSD"]
-
-    candles   = fetch_pair_intraday_1m_twelve(pair_code)
-    closes    = candles.map { |c| c[:close] }
-
-    sma_fast  = sma(closes, 5)
-    sma_slow  = sma(closes, 20)
-    rsi_val   = rsi(closes, 14)
-    atr_val   = atr(candles, 14)
-    bb        = bollinger(closes, 20, 2.0)
-    signal    = decide_signal(sma_fast, sma_slow, rsi_val)
-    pattern   = detect_candle_pattern(candles)
-    snr       = find_snr_levels(candles)
-
-    {
-      pair_name:   cfg[:name],
-      pair_code:   pair_code,
-      timeframe:   "1min",
-      last_price:  closes.last,
-      candle_time: candles.last[:time],
-      signal:      signal,
-      indicators: {
-        sma_fast:  sma_fast,
-        sma_slow:  sma_slow,
-        rsi:       rsi_val,
-        atr:       atr_val,
-        bb_middle: bb[:middle],
-        bb_upper:  bb[:upper],
-        bb_lower:  bb[:lower]
-      },
-      pattern: pattern,
-      snr: snr,
-      candles: candles
-    }.to_json
-  rescue => e
-    status 500
-    { error: e.message }.to_json
-  end
-end
-
-# ======== UPLOAD SCREENSHOT + OPENAI VISION ========
-post "/upload_chart" do
-  begin
-    file_param = params["chart_image"]
-    raise "File tidak ditemukan" if file_param.nil?
-
-    tempfile  = file_param[:tempfile]
-    ext       = File.extname(file_param[:filename])
-    ext       = ".png" if ext.empty?
-    safe_name = "#{SecureRandom.hex(8)}#{ext}"
-    upload_path = File.join(settings.public_folder, 'uploads', safe_name)
-
-    File.open(upload_path, "wb") { |f| f.write(tempfile.read) }
-
-    raise "OPENAI_API_KEY belum diset" if OPENAI_API_KEY.nil? || OPENAI_API_KEY.empty?
-
-    img_data   = File.binread(upload_path)
-    base64_img = Base64.strict_encode64(img_data)
-    data_url   = "data:image/png;base64,#{base64_img}"
-
-    payload = {
-      model: "gpt-4.1-mini",
-      input: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: "Ini screenshot chart trading forex. 1) Deteksi pola candlestick (engulfing, pin bar, doji, hammer, shooting star, dll). 2) Jelaskan apakah market cenderung uptrend, downtrend, atau sideways. 3) Berikan saran EDUKASI entry untuk latihan di akun demo (bukan saran finansial). Jawab singkat dan jelas dalam bahasa Indonesia."
-            },
-            {
-              type: "input_image",
-              image_url: data_url
-            }
-          ]
-        }
-      ]
-    }
-
-    headers = {
-      "Authorization" => "Bearer #{OPENAI_API_KEY}",
-      "Content-Type"  => "application/json"
-    }
-
-    res   = HTTParty.post(OPENAI_API_URL, headers: headers, body: payload.to_json)
-    parsed = JSON.parse(res.body) rescue {}
-
-    ai_comment =
-      if parsed["output"].is_a?(Array)
-        first = parsed["output"].first
-        if first && first["content"].is_a?(Array)
-          t = first["content"].find { |c| c["type"] == "output_text" }
-          t ? t["text"] : parsed.to_json
-        else
-          parsed.to_json
-        end
+    side, label =
+      if score >= 80
+        base = trend_signal == "SELL" ? "Strong Sell" : "Strong Buy"
+        [trend_signal == "SELL" ? "sell" : "buy", base]
+      elsif score >= 60
+        base = trend_signal == "SELL" ? "Weak Sell" : "Weak Buy"
+        [trend_signal == "SELL" ? "sell" : "buy", base]
+      elsif score > 40
+        ["neutral", "Netral / seimbang"]
       else
-        parsed.to_json
+        alt = (trend_signal == "BUY" ? "sell" : trend_signal == "SELL" ? "buy" : "sell")
+        [alt, "Setup lemah (hindari entry agresif)"]
       end
 
-    img_url = "/uploads/#{safe_name}"
-    redirect to("/?img=#{URI.encode_www_form_component(img_url)}&img_comment=#{URI.encode_www_form_component(ai_comment)}")
-  rescue => e
-    redirect to("/?img_error=#{URI.encode_www_form_component(e.message)}")
+    coaching =
+      case side
+      when "buy"
+        "Gunakan sinyal ini sebagai latihan mencari BUY searah trend, utamakan entry setelah koreksi ke SNR / support yang jelas."
+      when "sell"
+        "Gunakan sinyal ini sebagai latihan mencari SELL searah trend, perhatikan area resistance / zona premium sebelum entry."
+      else
+        "Gunakan momen ini untuk mengamati struktur market tanpa entry dulu. Latihan: tandai SNR & tunggu confluence yang lebih kuat."
+      end
+
+    {
+      score: score.round(1),
+      side: side,
+      label: label,
+      reasons: reasons,
+      coaching: coaching
+    }
   end
 end
 
-# ======== FRONTEND HTML / DASHBOARD ========
-get "/" do
-  uploaded_img_url  = params['img']
-  ai_image_comment  = params['img_comment']
-  img_error_message = params['img_error']
+# ========================== API SIGNAL =============================
 
+get "/signal" do
+  content_type :json
+
+  pair_param = params["pair"] || "EURUSD"
+  tf_param   = params["tf"]   || "1min"
+
+  pair_code =
+    case pair_param.upcase
+    when "EURUSD" then "EUR/USD"
+    when "GBPUSD" then "GBP/USD"
+    when "USDJPY" then "USD/JPY"
+    else pair_param
+    end
+
+  # batasi interval ke yang kita izinkan
+  interval =
+    case tf_param
+    when "1min", "5min", "15min"
+      tf_param
+    else
+      "1min"
+    end
+
+  candles = fetch_candles(pair_code, interval, 200)
+  halt 500, { error: "Tidak bisa ambil data candle" }.to_json if candles.empty?
+
+  closes = candles.map { |c| c[:close] }
+
+  sma_fast = sma(closes, 7)
+  sma_slow = sma(closes, 25)
+  rsi_val  = rsi(closes, 14)
+  atr_val  = atr(candles, 14)
+  bb       = bollinger_band(closes, 20, 2.0)
+
+  trend_signal =
+    if sma_fast && sma_slow
+      if sma_fast > sma_slow
+        "BUY"
+      elsif sma_fast < sma_slow
+        "SELL"
+      else
+        "WAIT"
+      end
+    else
+      "WAIT"
+    end
+
+  structure   = detect_market_structure(candles)
+  snr_levels  = build_snr_from_structure(structure)
+  bos_info    = detect_bos(structure)
+  pattern     = detect_candle_pattern(candles)
+
+  indicators_hash = {
+    sma_fast: sma_fast,
+    sma_slow: sma_slow,
+    rsi:      rsi_val,
+    atr:      atr_val,
+    bb:       bb,
+    price:    closes.last
+  }
+
+  confluence = build_confluence(trend_signal, structure, bos_info, indicators_hash, pattern)
+
+  {
+    pair: pair_code,
+    timeframe: interval,
+    last_price: closes.last,
+    last_time: candles.last[:time],
+    signal: trend_signal,
+    indicators: indicators_hash,
+    structure: structure,
+    snr:       snr_levels,
+    bos:       bos_info,
+    pattern:   pattern,
+    confluence: confluence,
+    candles:   candles
+  }.to_json
+end
+
+# ========================== API AI INSIGHT =============================
+
+post "/ai_insight" do
+  content_type :json
+  halt 400, { error: "OPENAI_API_KEY belum diset di environment." }.to_json unless OPENAI_KEY
+
+  body = request.body.read
+  payload = JSON.parse(body) rescue {}
+
+  signal      = payload["signal"]
+  indicators  = payload["indicators"] || {}
+  structure   = payload["structure"]  || {}
+  bos         = payload["bos"]        || {}
+  pattern     = payload["pattern"]    || {}
+  confluence  = payload["confluence"] || {}
+  pair        = payload["pair"]       || "EUR/USD"
+  timeframe   = payload["timeframe"]  || "1min"
+
+  summary_text = <<~TXT
+    Pair: #{pair}, Timeframe: #{timeframe}
+    Sinyal indikator utama: #{signal}
+    RSI: #{indicators["rsi"]}, ATR: #{indicators["atr"]}, SMA cepat: #{indicators["sma_fast"]}, SMA lambat: #{indicators["sma_slow"]}
+    Bollinger Band mid: #{indicators.dig("bb", "middle")}, upper: #{indicators.dig("bb", "upper")}, lower: #{indicators.dig("bb", "lower")}
+
+    Market structure:
+    - Trend: #{structure["trend"]}
+    - Bias: #{structure["bias"]}
+    - Komentar struktur: #{structure["comment"]}
+
+    Break of Structure (BOS):
+    - Status: #{bos["status"]}
+    - Direction: #{bos["direction"]}
+    - Note: #{bos["note"]}
+
+    Pola candlestick:
+    - Nama pola: #{pattern["name"]}
+    - Arah: #{pattern["direction"]}
+    - Confidence: #{pattern["confidence"]}
+    - Catatan pola: #{pattern["note"]}
+
+    Confluence engine:
+    - Score: #{confluence["score"]}
+    - Label: #{confluence["label"]}
+    - Side: #{confluence["side"]}
+    - Coaching: #{confluence["coaching"]}
+  TXT
+
+  uri = URI("https://api.openai.com/v1/chat/completions")
+  http = Net::HTTP.new(uri.host, uri.port)
+  http.use_ssl = true
+
+  headers = {
+    "Content-Type"  => "application/json",
+    "Authorization" => "Bearer #{OPENAI_KEY}"
+  }
+
+  request_body = {
+    model: "gpt-4.1-mini",
+    messages: [
+      {
+        role: "system",
+        content: "Kamu adalah asisten trading berbahasa Indonesia. Fokus edukasi, bukan sinyal pasti profit. Jelaskan kondisi market sederhana, sebutkan hal yang perlu diperhatikan, dan berikan saran latihan (bukan ajakan open posisi). Hindari janji profit, hanya bahas probabilitas & pembelajaran."
+      },
+      {
+        role: "user",
+        content: "Berikan analisa edukatif berdasarkan ringkasan data berikut (struktur market, indikator, BOS, pola candlestick, dan confluence) untuk latihan membaca market:\n\n#{summary_text}"
+      }
+    ],
+    temperature: 0.7
+  }
+
+  req = Net::HTTP::Post.new(uri.request_uri, headers)
+  req.body = request_body.to_json
+
+  begin
+    res = http.request(req)
+    unless res.is_a?(Net::HTTPSuccess)
+      halt 500, { error: "Gagal memanggil OpenAI", details: res.body }.to_json
+    end
+
+    data = JSON.parse(res.body) rescue nil
+    ai_text =
+      if data && data["choices"] && data["choices"][0] && data["choices"][0]["message"]
+        data["choices"][0]["message"]["content"]
+      else
+        "AI tidak mengembalikan respons yang bisa dibaca."
+      end
+
+    { ai_comment: ai_text }.to_json
+  rescue => e
+    halt 500, { error: "Error saat memanggil OpenAI", details: e.message }.to_json
+  end
+end
+
+# ========================== FRONTEND DASHBOARD =============================
+
+get "/" do
   <<~HTML
   <!DOCTYPE html>
-  <html>
+  <html lang="en">
   <head>
-    <meta charset="UTF-8"/>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>FX Realtime AI Trading Coach</title>
-    <script src="https://cdn.jsdelivr.net/npm/luxon@1.26.0"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1.0.0"></script>
-    <script src="https://www.chartjs.org/chartjs-chart-financial/chartjs-chart-financial.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@1.2.1/dist/chartjs-plugin-zoom.min.js"></script>
+    <meta charset="UTF-8">
+    <title>FX Realtime AI Coach</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
-      :root {
-        --bg-body: #020617;
-        --bg-panel: #020617;
-        --bg-card: rgba(15,23,42,0.92);
-        --bg-card-soft: rgba(15,23,42,0.9);
-        --border-subtle: rgba(148,163,184,0.3);
-        --text-main: #e5e7eb;
-        --text-muted: #9ca3af;
-        --accent-green: #22c55e;
-        --accent-red: #f97373;
-        --accent-yellow: #facc15;
-        --accent-cyan: #22d3ee;
-        --accent-pink: #ec4899;
-      }
-
-      * { box-sizing: border-box; }
-
       body {
         margin: 0;
-        font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", Arial, sans-serif;
-        background:
-          radial-gradient(circle at top left, rgba(56,189,248,0.08), transparent 55%),
-          radial-gradient(circle at bottom right, rgba(34,197,94,0.10), transparent 55%),
-          var(--bg-body);
-        color: var(--text-main);
-        min-height: 100vh;
+        padding: 12px;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #050510;
+        color: #f5f5f5;
       }
-
-      .shell {
-        max-width: 1200px;
-        margin: 0 auto;
-        padding: 14px 12px 40px;
+      .card {
+        background: radial-gradient(circle at top, #1b2236, #050510);
+        border-radius: 16px;
+        padding: 14px 14px 10px 14px;
+        margin-bottom: 12px;
+        border: 1px solid rgba(255,255,255,0.05);
+        box-shadow: 0 0 20px rgba(0,0,0,0.6);
       }
-
-      .app-header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 10px;
-        margin-bottom: 14px;
-      }
-
-      .brand-group {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-      }
-
-      .brand-logo {
-        width: 34px;
-        height: 34px;
-        border-radius: 999px;
-        background: radial-gradient(circle at 30% 20%, #22c55e 0, #16a34a 30%, #22d3ee 80%);
-        box-shadow:
-          0 0 18px rgba(34,197,94,0.9),
-          0 0 32px rgba(34,211,238,0.8);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-size: 19px;
-        font-weight: 900;
-        color: #020617;
-      }
-
-      .brand-text-main {
-        font-size: 17px;
+      .title-main {
+        font-size: 18px;
         font-weight: 700;
-        letter-spacing: 0.04em;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        text-align: center;
+        color: #00ffe7;
+        margin-bottom: 6px;
       }
-
-      .brand-text-sub {
+      .subtitle {
+        text-align: center;
         font-size: 11px;
-        color: var(--text-muted);
+        color: #9ba7ff;
+        margin-bottom: 10px;
       }
-
-      .header-right {
-        text-align: right;
-        font-size: 10px;
-        color: var(--text-muted);
-      }
-
-      .tag-pill {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        padding: 4px 10px;
+      .btn {
+        width: 100%;
+        padding: 10px;
         border-radius: 999px;
-        background: rgba(15,23,42,0.8);
-        border: 1px solid rgba(34,197,94,0.6);
-        box-shadow: 0 0 12px rgba(34,197,94,0.4);
-        margin-bottom: 4px;
-        font-size: 10px;
+        border: 1px solid #ff004c;
+        background: linear-gradient(90deg,#ff004c,#ff6600);
+        color: #fff;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: .08em;
+        box-shadow: 0 0 12px rgba(255,0,76,0.6);
       }
-
-      .tag-dot {
-        width: 7px;height: 7px;border-radius:999px;
-        background: radial-gradient(circle at 30% 30%, #22c55e, #16a34a);
+      .btn:active {
+        transform: scale(0.98);
+        opacity: 0.9;
       }
-
-      .layout-grid {
-        display: grid;
-        grid-template-columns: 1fr;
-        gap: 14px;
+      .label {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: .12em;
+        color: #7c8cff;
       }
-
-      @media (min-width: 900px) {
-        .layout-grid {
-          grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.05fr);
-          align-items: start;
-        }
-      }
-
-      .panel {
-        background: radial-gradient(circle at top left, rgba(34,197,94,0.05), transparent 55%),
-                    radial-gradient(circle at bottom right, rgba(8,47,73,0.6), transparent 55%),
-                    var(--bg-panel);
-        border-radius: 22px;
-        padding: 14px;
-        border: 1px solid rgba(148,163,184,0.22);
-        box-shadow:
-          0 18px 40px rgba(15,23,42,0.9),
-          0 0 60px rgba(15,118,110,0.4);
-      }
-
-      .panel-header {
-        display:flex;
-        justify-content:space-between;
-        align-items:flex-start;
-        gap:8px;
-        margin-bottom:10px;
-      }
-
-      .panel-title {
+      .value {
         font-size: 14px;
         font-weight: 600;
       }
-
-      .panel-sub {
-        font-size: 11px;
-        color: var(--text-muted);
-      }
-
-      .chip-soft {
-        padding: 4px 9px;
+      .pill {
+        display:inline-block;
+        padding: 2px 8px;
         border-radius: 999px;
-        background: rgba(15,23,42,0.9);
-        border: 1px solid rgba(148,163,184,0.5);
         font-size: 10px;
-        color: var(--text-main);
+        text-transform: uppercase;
+        letter-spacing: .14em;
       }
-
-      .chip-live {
-        display:inline-flex;
-        align-items:center;
-        gap:6px;
-        padding:3px 9px;
-        border-radius:999px;
-        font-size:10px;
-        background:rgba(15,23,42,0.95);
-        border:1px solid rgba(34,197,94,0.55);
+      .pill-buy { background: rgba(0,255,150,0.08); border:1px solid #00ff96; color:#00ffb7; }
+      .pill-sell { background: rgba(255,0,90,0.08); border:1px solid #ff3377; color:#ff5b98; }
+      .pill-wait { background: rgba(255,255,255,0.03); border:1px solid #999; color:#ccc; }
+      .grid-2 {
+        display:grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
       }
-
-      .live-dot {
-        width:7px;height:7px;border-radius:999px;
-        background:#22c55e;
-        box-shadow:0 0 10px rgba(34,197,94,0.9);
+      .mono { font-family: "JetBrains Mono", monospace; font-size: 11px; }
+      .ms-comment {
+        font-size: 11px;
+        color: #7dd0ff;
+        line-height: 1.4;
+        margin-top: 6px;
       }
-
-      .btn-refresh {
-        width:100%;
-        display:flex;
-        align-items:center;
-        justify-content:center;
-        gap:8px;
-        margin:6px 0 6px;
-        background: radial-gradient(circle at 0 0, rgba(251,113,133,0.4), rgba(127,29,29,0.95));
-        border: 1px solid rgba(34,197,94,0.8);
-        color:#f9fafb;
-        font-weight:600;
-        cursor:pointer;
-        padding:9px 16px;
+      .badge {
+        font-size: 10px;
+        padding: 2px 8px;
         border-radius: 999px;
-        font-size: 13px;
-        text-shadow:0 0 8px rgba(34,197,94,0.8);
-        box-shadow:
-          0 0 14px rgba(34,197,94,0.65),
-          0 0 26px rgba(190,18,60,0.8),
-          inset 0 0 10px rgba(0,0,0,0.9);
-        transition:0.18s ease-out;
+        background: rgba(255,255,255,0.05);
+        border: 1px solid rgba(255,255,255,0.09);
       }
-
-      .btn-refresh:hover {
-        transform: translateY(-1px) scale(1.02);
-        box-shadow:
-          0 0 20px rgba(34,197,94,0.85),
-          0 0 32px rgba(190,18,60,0.95),
-          inset 0 0 12px rgba(0,0,0,0.9);
+      .pattern-note {
+        font-size: 11px;
+        color: #ffd3a3;
+        margin-top: 4px;
       }
-
-      .btn-refresh:active {
-        transform: translateY(1px) scale(0.98);
-        box-shadow:
-          0 0 10px rgba(34,197,94,0.6),
-          0 0 18px rgba(190,18,60,0.8),
-          inset 0 0 16px rgba(0,0,0,0.95);
+      .conf-label {
+        font-size: 14px;
+        font-weight: 700;
       }
-
-      .btn-refresh span.icon {
-        font-size: 16px;
+      .conf-score {
+        font-size: 22px;
+        font-weight: 800;
       }
-
-      .status-text {
-        text-align:center;
-        color:var(--text-muted);
+      .reason-list {
+        font-size: 11px;
+        margin-top: 4px;
+      }
+      .input-small {
+        width: 100%;
+        padding: 4px 6px;
+        border-radius: 8px;
+        border: 1px solid #333;
+        background:#0b0b18;
+        color:#fff;
         font-size:11px;
-        margin-bottom:6px;
       }
-
-      .auto-row {
-        display:flex;
-        align-items:center;
-        justify-content:space-between;
-        gap:8px;
-        margin:4px 0 10px;
-        font-size:11px;
-        color:var(--text-muted);
-      }
-
-      .auto-btn {
-        padding:3px 10px;
-        border-radius:999px;
-        border:1px solid rgba(148,163,184,0.6);
-        background:rgba(15,23,42,0.9);
-        color:var(--text-muted);
-        cursor:pointer;
+      .hint {
         font-size:10px;
-        display:inline-flex;
-        align-items:center;
-        gap:6px;
-      }
-
-      .auto-btn.on {
-        border-color:rgba(34,197,94,0.9);
-        background:radial-gradient(circle at 0 0, rgba(34,197,94,0.4), rgba(21,128,61,0.95));
-        color:#e5e7eb;
-        box-shadow:0 0 12px rgba(34,197,94,0.8);
-      }
-
-      .auto-dot {
-        width:7px;height:7px;border-radius:999px;
-        background:rgba(148,163,184,0.7);
-      }
-      .auto-btn.on .auto-dot {
-        background:#22c55e;
-        box-shadow:0 0 10px rgba(34,197,94,0.9);
-      }
-
-      .signal-main-row {
-        display:flex;
-        justify-content:space-between;
-        align-items:flex-end;
-        gap:12px;
-        flex-wrap:wrap;
-        margin-top:6px;
-      }
-
-      .signal-section-left {
-        flex:1;
-        min-width:200px;
-      }
-
-      .signal-section-right {
-        min-width:180px;
-        text-align:right;
-      }
-
-      .titlePair {
-        margin:0;
-        font-size:15px;
-      }
-
-      .signal-value {
-        font-size:44px;
-        font-weight:800;
-        letter-spacing:0.05em;
-      }
-
-      .buy{color:#22c55e;text-shadow:0 0 14px rgba(34,197,94,0.8);}
-      .sell{color:#f97373;text-shadow:0 0 14px rgba(248,113,113,0.9);}
-      .hold{color:#facc15;text-shadow:0 0 14px rgba(250,204,21,0.7);}
-
-      .label {
-        font-size:11px;
-        color:var(--text-muted);
-      }
-
-      .pair-group, .tf-group {
-        display:flex;
-        flex-wrap:wrap;
-        gap:6px;
-        margin-top:4px;
-      }
-
-      .pair-btn, .tf-btn {
-        padding:4px 10px;
-        border-radius:999px;
-        border:1px solid rgba(148,163,184,0.7);
-        background:rgba(15,23,42,0.9);
-        cursor:pointer;
-        font-size:10px;
-        color:var(--text-main);
-        text-shadow:0 0 4px rgba(15,23,42,0.9);
-        transition:0.16s;
-      }
-
-      .pair-btn:hover, .tf-btn:hover {
-        transform:translateY(-1px);
-        border-color:rgba(148,163,184,1);
-      }
-
-      .pair-btn.active, .tf-btn.active {
-        background:radial-gradient(circle at 0 0, rgba(34,197,94,0.4), rgba(15,23,42,0.96));
-        border-color:rgba(34,197,94,0.9);
-        box-shadow:0 0 12px rgba(34,197,94,0.7);
-        color:#f9fafb;
-      }
-
-      .signal-metrics {
-        display:grid;
-        grid-template-columns: repeat(2, minmax(0,1fr));
-        gap:6px 10px;
-        margin-top:10px;
-        font-size:11px;
-      }
-
-      .metric-inline {
-        display:flex;
-        justify-content:space-between;
-        gap:6px;
-      }
-
-      .metric-label {
-        color:var(--text-muted);
-      }
-
-      .metric-value {
-        font-weight:600;
-      }
-
-      .chart-card {
-        background: radial-gradient(circle at top left, rgba(34,197,94,0.06), transparent 60%),
-                    radial-gradient(circle at bottom right, rgba(8,47,73,0.7), transparent 55%),
-                    rgba(15,23,42,0.98);
-        border-radius: 18px;
-        border:1px solid rgba(30,64,175,0.6);
-        padding:10px 10px 12px;
-        box-shadow:
-          0 22px 45px rgba(15,23,42,0.95),
-          0 0 60px rgba(30,64,175,0.8);
-      }
-
-      .chart-header-row {
-        display:flex;
-        justify-content:space-between;
-        align-items:center;
-        gap:8px;
-        margin-bottom:6px;
-      }
-
-      .chart-title {
-        font-size:13px;
-        font-weight:600;
-      }
-
-      .chart-sub {
-        font-size:10px;
-        color:var(--text-muted);
-      }
-
-      .chart-tag {
-        padding:3px 8px;
-        border-radius:999px;
-        background:rgba(15,23,42,0.9);
-        border:1px solid rgba(148,163,184,0.5);
-        font-size:10px;
-        color:var(--text-muted);
-      }
-
-      .mini-chart-inner {
-        position:relative;
-        height:270px;
-        margin-top:4px;
-      }
-
-      #priceChart {
-        height:270px!important;
-        width:100%!important;
-      }
-
-      .ai-card {
-        background:radial-gradient(circle at top left, rgba(56,189,248,0.18), transparent 60%),
-                   radial-gradient(circle at bottom right, rgba(34,197,94,0.16), transparent 60%),
-                   rgba(15,23,42,0.98);
-        border-radius:18px;
-        padding:12px;
-        border:1px solid rgba(56,189,248,0.55);
-        box-shadow:
-          0 18px 40px rgba(15,23,42,0.95),
-          0 0 50px rgba(59,130,246,0.9);
-      }
-
-      .ai-header {
-        display:flex;
-        justify-content:space-between;
-        align-items:flex-start;
-        gap:8px;
-        margin-bottom:6px;
-      }
-
-      .ai-title {
-        font-size:14px;
-        font-weight:600;
-      }
-
-      .ai-badge {
-        padding:3px 9px;
-        border-radius:999px;
-        font-size:10px;
-        border:1px solid rgba(148,163,184,0.8);
-        background:rgba(15,23,42,0.9);
-      }
-
-      .badge-up {
-        border-color:rgba(34,197,94,0.9);
-        color:#bbf7d0;
-        box-shadow:0 0 14px rgba(34,197,94,0.9);
-      }
-
-      .badge-down {
-        border-color:rgba(248,113,113,0.9);
-        color:#fecaca;
-        box-shadow:0 0 14px rgba(248,113,113,0.9);
-      }
-
-      .badge-sideways {
-        border-color:rgba(234,179,8,0.9);
-        color:#fef3c7;
-        box-shadow:0 0 14px rgba(234,179,8,0.8);
-      }
-
-      .ai-text {
-        font-size:12px;
-        line-height:1.5;
-        margin-bottom:6px;
-      }
-
-      .ai-note {
-        font-size:10px;
-        color:var(--text-muted);
-      }
-
-      .pattern-card {
-        background:rgba(15,23,42,0.98);
-        border-radius:16px;
-        padding:10px 11px;
-        border:1px solid rgba(148,163,184,0.35);
-        margin-top:10px;
-      }
-
-      .pattern-title {
-        font-size:12px;
-        font-weight:600;
-        margin-bottom:4px;
-      }
-
-      .pattern-row {
-        display:grid;
-        grid-template-columns: repeat(2,minmax(0,1fr));
-        gap:4px 8px;
-        font-size:11px;
-        margin-bottom:4px;
-      }
-
-      .pattern-label {
-        color:var(--text-muted);
-      }
-
-      .pattern-value {
-        font-weight:600;
-      }
-
-      .upload-card {
-        background:rgba(15,23,42,0.97);
-        border-radius:18px;
-        padding:12px;
-        border:1px solid rgba(148,163,184,0.35);
-      }
-
-      .upload-img {
-        max-width:100%;
-        border-radius:12px;
-        margin-top:8px;
-        border:1px solid rgba(55,65,81,0.9);
-      }
-
-      .upload-note {
-        font-size:11px;
-        color:var(--text-muted);
-      }
-
-      input[type="file"] {
-        font-size:11px;
-        color:var(--text-main);
-      }
-
-      .pair-table {
-        width:100%;
-        border-collapse:collapse;
-        font-size:11px;
-        margin-top:6px;
-      }
-
-      .pair-table th, .pair-table td {
-        border:1px solid rgba(31,41,55,0.9);
-        padding:5px 7px;
-      }
-
-      .pair-table th {
-        background:rgba(15,23,42,0.98);
-        text-align:left;
-      }
-
-      .pair-table tr:nth-child(even) {
-        background:rgba(15,23,42,0.92);
-      }
-
-      pre {
-        margin-top:10px;
-        background:rgba(2,6,23,0.95);
-        color:var(--text-muted);
-        padding:8px;
-        border-radius:12px;
-        font-size:10px;
-        max-height:200px;
-        overflow:auto;
-        border:1px solid rgba(30,64,175,0.7);
-      }
-
-      @media (max-width: 600px) {
-        .signal-value { font-size:36px; }
-        .mini-chart-inner { height:230px; }
-        #priceChart { height:230px!important; }
+        color:#9ba7ff;
       }
     </style>
   </head>
   <body>
-    <div class="shell">
-      <header class="app-header">
-        <div class="brand-group">
-          <div class="brand-logo">FX</div>
+    <div class="card">
+      <div class="title-main">FX REALTIME AI COACH</div>
+      <div class="subtitle">Latihan baca struktur market, candlestick & confluence dengan data realtime (TwelveData).</div>
+
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;">
+        <div style="display:flex;gap:8px;">
           <div>
-            <div class="brand-text-main">Realtime AI Trading Coach</div>
-            <div class="brand-text-sub">EUR/USD · Demo learning assistant · 1M data feed</div>
+            <div class="label">PAIR</div>
+            <select id="pairSelect" class="input-small" style="border-radius:999px;">
+              <option value="EURUSD">EUR/USD</option>
+              <option value="GBPUSD">GBP/USD</option>
+              <option value="USDJPY">USD/JPY</option>
+            </select>
+          </div>
+          <div>
+            <div class="label">TIMEFRAME</div>
+            <select id="tfSelect" class="input-small" style="border-radius:999px;">
+              <option value="1min">1m</option>
+              <option value="5min">5m</option>
+              <option value="15min">15m</option>
+            </select>
           </div>
         </div>
-        <div class="header-right">
-          <div class="tag-pill">
-            <span class="tag-dot"></span>
-            <span>EDU MODE · NOT FINANCIAL ADVICE</span>
-          </div>
-          <div>Data source: TwelveData · AI: OpenAI</div>
+        <div style="text-align:right;">
+          <div class="label">LAST UPDATE</div>
+          <div class="value mono" id="lastTime">-</div>
         </div>
-      </header>
+      </div>
 
-      <div class="layout-grid">
-        <!-- PANEL KIRI: SIGNAL + AI -->
-        <section class="panel">
-          <div class="panel-header">
-            <div>
-              <div class="panel-title">Signal & Setup</div>
-              <div class="panel-sub">Pilih pair & timeframe label, lalu refresh atau aktifkan auto-refresh.</div>
-            </div>
-            <div class="chip-soft">Mode: 1M Forex Realtime</div>
+      <button class="btn" onclick="ambilSignal()">⚡ REFRESH SIGNAL</button>
+
+      <div style="margin-top:8px;display:flex;justify-content:space-between;align-items:center;">
+        <div>
+          <div class="label">PRICE</div>
+          <div class="value mono" id="lastPrice">-</div>
+        </div>
+        <div style="text-align:right;">
+          <div class="label">SIGNAL</div>
+          <span id="signalPill" class="pill pill-wait">WAIT</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="label">INDIKATOR UTAMA</div>
+      <div class="grid-2" style="margin-top:6px;">
+        <div>
+          <div class="label">RSI (14)</div>
+          <div class="value" id="rsiVal">-</div>
+        </div>
+        <div>
+          <div class="label">ATR (14)</div>
+          <div class="value mono" id="atrVal">-</div>
+        </div>
+        <div>
+          <div class="label">SMA FAST (7)</div>
+          <div class="value mono" id="smaFastVal">-</div>
+        </div>
+        <div>
+          <div class="label">SMA SLOW (25)</div>
+          <div class="value mono" id="smaSlowVal">-</div>
+        </div>
+      </div>
+      <div style="margin-top:8px;">
+        <span class="badge" id="bbInfo">BB: -</span>
+      </div>
+    </div>
+
+    <!-- PANEL RISK MANAGEMENT ALA OLYM -->
+    <div class="card">
+      <div class="label">RISK MANAGEMENT (ALA OLYM)</div>
+      <div style="margin-top:6px;" class="grid-2">
+        <div>
+          <div class="label">Saldo Akun (demo)</div>
+          <input id="rmBalance" class="input-small" type="number" value="1000" step="1">
+          <div class="hint">Contoh: 100, 500, 1000</div>
+        </div>
+        <div>
+          <div class="label">Risk per Trade (%)</div>
+          <input id="rmRiskPct" class="input-small" type="number" value="2" step="0.1">
+          <div class="hint">Umum: 1 - 3%</div>
+        </div>
+        <div>
+          <div class="label">Payout (%)</div>
+          <input id="rmPayout" class="input-small" type="number" value="80" step="1">
+          <div class="hint">Olym sering 70–90%</div>
+        </div>
+        <div>
+          <div class="label">Durasi Entry</div>
+          <select id="rmDuration" class="input-small">
+            <option value="1m">1 Menit</option>
+            <option value="2m">2 Menit</option>
+            <option value="3m">3 Menit</option>
+            <option value="5m">5 Menit</option>
+            <option value="15m">15 Menit</option>
+          </select>
+          <div class="hint">Samakan dengan durasi di Olym</div>
+        </div>
+      </div>
+
+      <button class="btn" style="margin-top:10px;padding:8px;font-size:11px;" onclick="hitungRisk()">💰 HITUNG AMOUNT & RISK</button>
+
+      <div style="margin-top:8px;" class="grid-2">
+        <div>
+          <div class="label">Amount Ideal</div>
+          <div class="value mono" id="rmAmount">-</div>
+        </div>
+        <div>
+          <div class="label">Max Loss (Jika kalah)</div>
+          <div class="value mono" id="rmMaxLoss">-</div>
+        </div>
+        <div>
+          <div class="label">Profit (Jika menang)</div>
+          <div class="value mono" id="rmProfit">-</div>
+        </div>
+        <div>
+          <div class="label">Total Kembali</div>
+          <div class="value mono" id="rmTotalReturn">-</div>
+        </div>
+      </div>
+      <div class="ms-comment" id="rmNote" style="margin-top:6px;">
+        Gunakan panel ini hanya sebagai simulasi / panduan risk saat entry manual di akun demo.
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="label">POLA CANDLESTICK</div>
+      <div style="margin-top:6px;">
+        <div class="grid-2">
+          <div>
+            <div class="label">Nama Pola</div>
+            <div class="value" id="patName">-</div>
           </div>
-
-          <button class="btn-refresh" onclick="ambilSignal(true)">
-            <span class="icon">⚡</span>
-            <span>REFRESH SIGNAL</span>
-          </button>
-          <p id="status" class="status-text">Ready...</p>
-
-          <div class="auto-row">
-            <span>Auto refresh setiap 15 detik (untuk latihan live membaca pergerakan candle).</span>
-            <button id="autoBtn" class="auto-btn" onclick="toggleAuto()">
-              <span class="auto-dot"></span>
-              <span>AUTO: OFF</span>
-            </button>
+          <div>
+            <div class="label">Arah</div>
+            <div class="value" id="patDir">-</div>
           </div>
+        </div>
+        <div style="margin-top:6px;">
+          <div class="label">Confidence</div>
+          <div class="value" id="patConf">-</div>
+        </div>
+        <div class="pattern-note" id="patNote">
+          Menunggu pola candlestick...
+        </div>
+      </div>
+    </div>
 
-          <div class="signal-main-row">
-            <div class="signal-section-left">
-              <h2 id="titlePair" class="titlePair">Signal EUR/USD (1M Realtime)</h2>
-              <div class="label">Cocok untuk latihan baca candlestick dan konfirmasi sebelum entry demo.</div>
-
-              <div style="margin-top:8px;">
-                <div class="label">Pilih Pair:</div>
-                <div class="pair-group">
-                  <button class="pair-btn active" data-pair="EURUSD">EUR/USD</button>
-                  <button class="pair-btn" data-pair="GBPUSD">GBP/USD</button>
-                  <button class="pair-btn" data-pair="USDJPY">USD/JPY</button>
-                </div>
-              </div>
-
-              <div style="margin-top:8px;">
-                <div class="label">Timeframe Label (hanya label, data tetap 1M):</div>
-                <div class="tf-group">
-                  <button class="tf-btn active" data-tf="1m">1M</button>
-                  <button class="tf-btn" data-tf="5m">5M</button>
-                  <button class="tf-btn" data-tf="15m">15M</button>
-                  <button class="tf-btn" data-tf="30m">30M</button>
-                  <button class="tf-btn" data-tf="1h">1H</button>
-                </div>
-              </div>
-            </div>
-
-            <div class="signal-section-right">
-              <div class="chip-live">
-                <span class="live-dot"></span>
-                <span>LIVE FEED</span>
-              </div>
-              <div id="signal" class="signal-value" style="margin-top:4px;">-</div>
-              <div class="label">Last Price: <b id="price"></b></div>
-              <div class="label">Candle time: <b id="ctime"></b></div>
-            </div>
+    <div class="card">
+      <div class="label">AI CONFLUENCE COACH</div>
+      <div style="margin-top:6px;">
+        <div class="grid-2">
+          <div>
+            <div class="label">Rating Setup</div>
+            <div class="conf-label" id="confLabel">-</div>
           </div>
-
-          <div class="signal-metrics">
-            <div class="metric-inline">
-              <span class="metric-label">RSI (14)</span>
-              <span class="metric-value" id="rsi">-</span>
-            </div>
-            <div class="metric-inline">
-              <span class="metric-label">ATR (14)</span>
-              <span class="metric-value" id="atr">-</span>
-            </div>
-            <div class="metric-inline">
-              <span class="metric-label">SMA Fast (5)</span>
-              <span class="metric-value" id="sma5">-</span>
-            </div>
-            <div class="metric-inline">
-              <span class="metric-label">SMA Slow (20)</span>
-              <span class="metric-value" id="sma20">-</span>
-            </div>
-            <div class="metric-inline">
-              <span class="metric-label">BB Mid</span>
-              <span class="metric-value" id="bbMid">-</span>
-            </div>
-            <div class="metric-inline">
-              <span class="metric-label">BB Upper</span>
-              <span class="metric-value" id="bbUp">-</span>
-            </div>
-            <div class="metric-inline">
-              <span class="metric-label">BB Lower</span>
-              <span class="metric-value" id="bbLow">-</span>
-            </div>
+          <div style="text-align:right;">
+            <div class="label">Score</div>
+            <div class="conf-score" id="confScore">-</div>
           </div>
+        </div>
+        <div class="ms-comment" id="confCoach" style="margin-top:6px;">
+          Menunggu analisa confluence...
+        </div>
+        <div class="reason-list" id="confReasons"></div>
+      </div>
+    </div>
 
-          <div class="ai-card" style="margin-top:12px;">
-            <div class="ai-header">
-              <div>
-                <div class="ai-title">AI Market Insight (Data Realtime)</div>
-                <div class="label">Ringkasan trend, momentum, volatilitas untuk latihan keputusan.</div>
-              </div>
-              <span id="aiTrendBadge" class="ai-badge">Menunggu data...</span>
-            </div>
-            <p id="aiText" class="ai-text">
-              Setelah data beberapa puluh candle terkumpul, AI akan memberi komentar kondisi trend, momentum & volatilitas.
-            </p>
-            <p class="ai-note">Gunakan ini sebagai alat edukasi, bukan sinyal pasti. Fokus ke kualitas analisa, bukan tebak-tebakan.</p>
-
-            <div class="pattern-card">
-              <div class="pattern-title">AI Pola Candlestick (Realtime / Data)</div>
-              <p class="label" style="margin-bottom:4px;">
-                Pola dibaca dari 3 candle terakhir 1M. Cocok untuk latihan mengenali pola visual yang sering muncul.
-              </p>
-              <div class="pattern-row">
-                <div>
-                  <span class="pattern-label">Nama Pola</span><br>
-                  <span class="pattern-value" id="patName">-</span>
-                </div>
-                <div>
-                  <span class="pattern-label">Arah</span><br>
-                  <span class="pattern-value" id="patDir">-</span>
-                </div>
-                <div>
-                  <span class="pattern-label">Confidence</span><br>
-                  <span class="pattern-value" id="patConf">-</span>
-                </div>
-              </div>
-              <p class="ai-text" id="patNote">Menunggu data...</p>
-            </div>
+    <div class="card">
+      <div class="label">MARKET STRUCTURE (HH / HL / LH / LL)</div>
+      <div style="margin-top:6px;">
+        <div class="grid-2">
+          <div>
+            <div class="label">Trend</div>
+            <div class="value" id="msTrend">-</div>
           </div>
-        </section>
-
-        <!-- PANEL KANAN: CHART + DETAIL + UPLOAD -->
-        <section class="panel">
-          <div class="chart-card">
-            <div class="chart-header-row">
-              <div>
-                <div class="chart-title">Candlestick History 1M + Auto SNR</div>
-                <div id="tfLabel" class="chart-sub">
-                  History Candlestick · Interval: 1M · Pair: EUR/USD · TF Label: 1M · Zoom: scroll/pinch, Pan: drag.
-                </div>
-              </div>
-              <div class="chart-tag">Garis cyan = Support, pink = Resistance</div>
-            </div>
-            <div class="mini-chart-inner">
-              <canvas id="priceChart"></canvas>
-            </div>
+          <div>
+            <div class="label">Bias Latihan</div>
+            <div class="value" id="msBias">-</div>
           </div>
+        </div>
 
-          <div class="upload-card" style="margin-top:12px;">
-            <div class="panel-header" style="margin-bottom:6px;">
-              <div>
-                <div class="panel-title">Upload Screenshot Market</div>
-                <div class="panel-sub">Bandingkan hasil bacaan AI dari gambar chart (misal OlympTrade demo) dengan data realtime.</div>
-              </div>
-              <div class="chip-soft">Mode: AI Vision</div>
-            </div>
-            #{img_error_message ? "<p class=\"label\" style=\"color:#f97373;\">Error upload: #{img_error_message}</p>" : ""}
-            <form action="/upload_chart" method="POST" enctype="multipart/form-data">
-              <input type="file" name="chart_image" accept="image/*" required><br>
-              <button type="submit" class="btn-refresh" style="font-size:12px;padding:7px 14px;margin-top:6px;">
-                <span class="icon">🧠</span>
-                <span>Upload Screenshot & Analisa AI</span>
-              </button>
-            </form>
-            <p class="upload-note">Gunakan hanya screenshot chart. Jangan upload data pribadi atau informasi sensitif lainnya.</p>
-            #{if uploaded_img_url
-                "<img src=\"#{uploaded_img_url}\" class=\"upload-img\" alt=\"Uploaded chart\" />" \
-                "<p class=\"label\" style=\"margin-top:6px;\">AI komentar:</p>" \
-                "<p class=\"ai-text\">#{ai_image_comment || "Gambar sudah dianalisa AI."}</p>"
-              else
-                "<p class=\"label\" style=\"margin-top:6px;\">Belum ada screenshot yang diupload.</p>"
-              end
-            }
-          </div>
+        <div style="margin-top:6px;">
+          <div class="label">Swing Terakhir</div>
+          <div class="value mono" id="msLastPoint">-</div>
+        </div>
 
-          <div class="upload-card" style="margin-top:12px;">
-            <div class="panel-title">Detail Data Aktif</div>
-            <table class="pair-table">
-              <tr><th>Parameter</th><th>Nilai</th></tr>
-              <tr><td>Pair Name</td><td id="tblPair">-</td></tr>
-              <tr><td>Pair Code</td><td id="tblPairCode">-</td></tr>
-              <tr><td>Timeframe (data)</td><td id="tblTF">-</td></tr>
-              <tr><td>Timeframe (label)</td><td id="tblTFView">-</td></tr>
-              <tr><td>Harga Terakhir</td><td id="tblPrice">-</td></tr>
-              <tr><td>RSI (14)</td><td id="tblRSI">-</td></tr>
-              <tr><td>SMA Fast (5)</td><td id="tblSMA5">-</td></tr>
-              <tr><td>SMA Slow (20)</td><td id="tblSMA20">-</td></tr>
-              <tr><td>ATR (14)</td><td id="tblATR">-</td></tr>
-              <tr><td>Bollinger Mid</td><td id="tblBBMid">-</td></tr>
-              <tr><td>Bollinger Upper</td><td id="tblBBUp">-</td></tr>
-              <tr><td>Bollinger Lower</td><td id="tblBBLow">-</td></tr>
-              <tr><td>Waktu Candle Terakhir</td><td id="tblTime">-</td></tr>
-            </table>
+        <div style="margin-top:6px;">
+          <div class="label">Break of Structure (BOS)</div>
+          <div class="value mono" id="bosInfo">-</div>
+        </div>
 
-            <pre id="raw">{}</pre>
-          </div>
-        </section>
+        <div class="ms-comment" id="msComment">
+          Menunggu data struktur market...
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="label">SNR DARI STRUCTURE TERBARU</div>
+      <div id="snrList" style="margin-top:6px;font-size:11px;" class="mono">-</div>
+    </div>
+
+    <div class="card">
+      <div class="label">AI PENJELASAN MARKET</div>
+      <div style="margin-top:6px;">
+        <button class="btn" style="padding:8px;font-size:11px;margin-bottom:8px;" onclick="mintaAI()">🤖 MINTA PENJELASAN AI</button>
+        <div id="aiStatus" style="font-size:11px;color:#9ba7ff;margin-bottom:4px;">AI siap membantu menjelaskan kondisi market untuk latihan.</div>
+        <div id="aiText" style="font-size:12px;line-height:1.5;color:#f1f1f1;">
+          -
+        </div>
       </div>
     </div>
 
     <script>
-      let chartObj=null,allCandles=[],currentTF="1m",currentPair="EURUSD",autoOn=false,autoTimer=null,lastData=null;
+      let lastSnapshot = null;
 
-      async function ambilSignal(fromButton=false){
-        const st=document.getElementById("status");
-        st.innerText="Loading...";
-        try{
-          const res=await fetch("/signal?pair="+currentPair+"&t="+Date.now());
-          if(!res.ok){
-            let msg="HTTP "+res.status;
-            try{const err=await res.json();if(err&&err.error)msg=err.error;}catch(e){}
-            throw new Error(msg);
+      async function ambilSignal() {
+        const pair = document.getElementById("pairSelect").value;
+        const tf   = document.getElementById("tfSelect").value;
+
+        try {
+          const res = await fetch(`/signal?pair=${pair}&tf=${tf}`);
+          const data = await res.json();
+
+          lastSnapshot = data;
+
+          document.getElementById("lastPrice").innerText = data.last_price.toFixed(5);
+          document.getElementById("lastTime").innerText  = new Date(data.last_time).toLocaleTimeString();
+
+          const sig = data.signal || "WAIT";
+          const pill = document.getElementById("signalPill");
+          pill.textContent = sig;
+          pill.className = "pill " + (sig === "BUY" ? "pill-buy" : sig === "SELL" ? "pill-sell" : "pill-wait");
+
+          const ind = data.indicators || {};
+          document.getElementById("rsiVal").innerText = ind.rsi ? ind.rsi.toFixed(1) : "-";
+          document.getElementById("atrVal").innerText = ind.atr ? ind.atr.toFixed(5) : "-";
+          document.getElementById("smaFastVal").innerText = ind.sma_fast ? ind.sma_fast.toFixed(5) : "-";
+          document.getElementById("smaSlowVal").innerText = ind.sma_slow ? ind.sma_slow.toFixed(5) : "-";
+
+          const bb = ind.bb;
+          document.getElementById("bbInfo").innerText = bb
+            ? `BB mid ${bb.middle.toFixed(5)} | up ${bb.upper.toFixed(5)} | low ${bb.lower.toFixed(5)}`
+            : "BB: -";
+
+          const pattern = data.pattern || {};
+          document.getElementById("patName").innerText = pattern.name || "-";
+          document.getElementById("patDir").innerText  = pattern.direction || "-";
+          document.getElementById("patConf").innerText =
+            pattern.confidence ? (pattern.confidence * 100).toFixed(0) + "%" : "-";
+          document.getElementById("patNote").innerText = pattern.note || "";
+
+          const conf = data.confluence || {};
+          document.getElementById("confLabel").innerText = conf.label || "-";
+          document.getElementById("confScore").innerText = conf.score != null ? conf.score : "-";
+          document.getElementById("confCoach").innerText = conf.coaching || "-";
+          const reasons = conf.reasons || [];
+          document.getElementById("confReasons").innerHTML =
+            reasons.length > 0 ? ("• " + reasons.join("<br>• ")) : "";
+
+          const ms = data.structure || {};
+          const trendMap = {
+            uptrend: "Uptrend (HH & HL dominan)",
+            downtrend: "Downtrend (LH & LL dominan)",
+            sideways: "Sideways / range",
+            unknown: "Unknown"
+          };
+          const biasMap = {
+            buy_bias:  "BUY bias (latihan fokus buy searah trend)",
+            sell_bias: "SELL bias (latihan fokus sell searah trend)",
+            neutral:   "Netral / tunggu setup jelas"
+          };
+
+          document.getElementById("msTrend").innerText = trendMap[ms.trend] || "-";
+          document.getElementById("msBias").innerText  = biasMap[ms.bias] || "-";
+
+          let lastPointText = "-";
+          if (ms.points && ms.points.length > 0) {
+            const lp = ms.points[ms.points.length - 1];
+            lastPointText = `${lp.label} @ ${lp.price.toFixed(5)} (${new Date(lp.time).toLocaleTimeString()})`;
           }
-          const data=await res.json();
-          lastData = data;
-          allCandles=data.candles||[];
+          document.getElementById("msLastPoint").innerText = lastPointText;
+          document.getElementById("msComment").innerText   = ms.comment || "";
 
-          document.getElementById("titlePair").innerText="Signal "+(data.pair_name||currentPair)+" (1M Realtime)";
-          const sigEl=document.getElementById("signal");
-          sigEl.innerText=data.signal.toUpperCase();
-          sigEl.className="signal-value "+data.signal;
+          const bos = data.bos || {};
+          let bosText = "-";
+          if (bos.status === "bos_up" || bos.status === "bos_down") {
+            const dir = bos.status === "bos_up" ? "Bullish BOS (naik)" : "Bearish BOS (turun)";
+            if (bos.price) {
+              bosText = `${dir} @ ${bos.price.toFixed(5)} (${bos.time ? new Date(bos.time).toLocaleTimeString() : "-"})`;
+            } else {
+              bosText = dir;
+            }
+          } else if (bos.label) {
+            bosText = `Belum BOS jelas. Swing terakhir: ${bos.label} @ ${bos.price ? bos.price.toFixed(5) : "-"}`;
+          }
+          document.getElementById("bosInfo").innerText = bosText;
 
-          document.getElementById("price").innerText=data.last_price.toFixed(5);
-          document.getElementById("rsi").innerText=data.indicators.rsi.toFixed(2);
-          document.getElementById("sma5").innerText=data.indicators.sma_fast.toFixed(5);
-          document.getElementById("sma20").innerText=data.indicators.sma_slow.toFixed(5);
-
-          if (data.indicators.atr) {
-            document.getElementById("atr").innerText = data.indicators.atr.toFixed(5);
-            document.getElementById("tblATR").innerText = data.indicators.atr.toFixed(5);
+          const snr = data.snr || [];
+          if (snr.length === 0) {
+            document.getElementById("snrList").innerText = "-";
           } else {
-            document.getElementById("atr").innerText = "-";
-            document.getElementById("tblATR").innerText = "-";
+            document.getElementById("snrList").innerHTML = snr.map(s => {
+              return `${s.type} @ ${s.price.toFixed(5)} (${new Date(s.time).toLocaleTimeString()})`;
+            }).join("<br>");
           }
 
-          if (data.indicators.bb_middle) {
-            document.getElementById("bbMid").innerText = data.indicators.bb_middle.toFixed(5);
-            document.getElementById("bbUp").innerText  = data.indicators.bb_upper.toFixed(5);
-            document.getElementById("bbLow").innerText = data.indicators.bb_lower.toFixed(5);
-
-            document.getElementById("tblBBMid").innerText = data.indicators.bb_middle.toFixed(5);
-            document.getElementById("tblBBUp").innerText  = data.indicators.bb_upper.toFixed(5);
-            document.getElementById("tblBBLow").innerText = data.indicators.bb_lower.toFixed(5);
-          } else {
-            document.getElementById("bbMid").innerText = "-";
-            document.getElementById("bbUp").innerText  = "-";
-            document.getElementById("bbLow").innerText = "-";
-            document.getElementById("tblBBMid").innerText = "-";
-            document.getElementById("tblBBUp").innerText  = "-";
-            document.getElementById("tblBBLow").innerText = "-";
-          }
-
-          document.getElementById("ctime").innerText=data.candle_time;
-
-          document.getElementById("tblPair").innerText=data.pair_name||"-";
-          document.getElementById("tblPairCode").innerText=data.pair_code||"-";
-          document.getElementById("tblTF").innerText=data.timeframe||"1min";
-          document.getElementById("tblTFView").innerText=currentTF+" (label tampilan)";
-          document.getElementById("tblPrice").innerText=data.last_price.toFixed(5);
-          document.getElementById("tblRSI").innerText=data.indicators.rsi.toFixed(2);
-          document.getElementById("tblSMA5").innerText=data.indicators.sma_fast.toFixed(5);
-          document.getElementById("tblSMA20").innerText=data.indicators.sma_slow.toFixed(5);
-          document.getElementById("tblTime").innerText=data.candle_time;
-
-          document.getElementById("raw").innerText=JSON.stringify(data,null,2);
-
-          if (data.pattern) {
-            document.getElementById("patName").innerText = data.pattern.name || "-";
-            document.getElementById("patDir").innerText  = data.pattern.direction || "-";
-            document.getElementById("patConf").innerText =
-              data.pattern.confidence ? (data.pattern.confidence * 100).toFixed(0) + "%" : "-";
-            document.getElementById("patNote").innerText = data.pattern.note || "";
-          }
-
-          drawFullHistory(data.pair_name||currentPair);
-          analyzeMarketAI(data);
-
-          st.innerText="Updated ✔"+(fromButton?" (manual)":"");
-        }catch(e){
-          st.innerText="Error: "+e.message;
+          document.getElementById("aiStatus").innerText = "AI siap menjelaskan kondisi market berdasarkan snapshot terakhir.";
+        } catch (e) {
           console.error(e);
+          alert("Gagal ambil signal. Cek koneksi / TWELVEDATA_KEY.");
         }
       }
 
-      function drawFullHistory(pairName){
-        const tfLabel=document.getElementById("tfLabel");
-        tfLabel.innerText="History Candlestick · Interval: 1M · Pair: "+pairName+" · TF Label: "+currentTF+" · Zoom: scroll/pinch, Pan: drag.";
-        drawCandleChart(allCandles);
-      }
-
-      function drawCandleChart(candles){
-        const ctx=document.getElementById("priceChart").getContext("2d");
-        const values=candles.map(c=>({x:new Date(c.time),o:c.open,h:c.high,l:c.low,c:c.close}));
-
-        const snr = lastData && lastData.snr ? lastData.snr : {support: [], resistance: []};
-        const supports = (snr.support || []).map(v => ({
-          label: "Support " + v.toFixed(5),
-          value: v
-        }));
-        const resistances = (snr.resistance || []).map(v => ({
-          label: "Resistance " + v.toFixed(5),
-          value: v
-        }));
-
-        if(chartObj)chartObj.destroy();
-
-        chartObj=new Chart(ctx,{
-          type:"candlestick",
-          data:{
-            datasets:[
-              {
-                label:"Price",
-                data:values,
-                type:"candlestick",
-                color:{up:"#22c55e",down:"#f97373",unchanged:"#9ca3af"},
-                borderColor:{up:"#16a34a",down:"#b91c1c",unchanged:"#9ca3af"},
-                borderWidth:2,
-                barThickness:6,
-                maxBarThickness:8
-              },
-              ...supports.map(s => ({
-                label: s.label,
-                data: values.map(v => ({ x: v.x, y: s.value })),
-                type: "line",
-                borderWidth:1,
-                borderColor:"#22d3ee",
-                pointRadius:0
-              })),
-              ...resistances.map(r => ({
-                label: r.label,
-                data: values.map(v => ({ x: v.x, y: r.value })),
-                type: "line",
-                borderWidth:1,
-                borderColor:"#ec4899",
-                pointRadius:0
-              }))
-            ]
-          },
-          options:{
-            plugins:{
-              legend:{display:false},
-              zoom:{pan:{enabled:true,mode:"x"},zoom:{wheel:{enabled:true},pinch:{enabled:true},drag:{enabled:false},mode:"x"}}
-            },
-            scales:{
-              x:{type:"time",time:{unit:"minute",tooltipFormat:"HH:mm dd-LL"},
-                ticks:{display:true,maxTicksLimit:8,color:"#9ca3af",font:{size:9}},
-                grid:{display:true,color:"rgba(148,163,184,0.15)"},offset:true},
-              y:{ticks:{display:true,color:"#9ca3af",font:{size:9}},grid:{display:true,color:"rgba(148,163,184,0.15)"}}
-            },
-            responsive:true,maintainAspectRatio:false
-          }
-        });
-      }
-
-      function analyzeMarketAI(data){
-        const aiTextEl=document.getElementById("aiText"),badgeEl=document.getElementById("aiTrendBadge"),candles=data.candles||[];
-        if(!aiTextEl||!badgeEl)return;
-        const n=candles.length;
-        if(n<20){
-          badgeEl.className="ai-badge";
-          badgeEl.innerText="Data minim";
-          aiTextEl.innerText="Data candle masih sedikit. Tunggu beberapa menit supaya AI bisa membaca trend dan pola market.";
+      async function mintaAI() {
+        if (!lastSnapshot) {
+          document.getElementById("aiStatus").innerText = "Ambil signal dulu sebelum minta penjelasan AI.";
           return;
         }
-        const closes=candles.map(c=>c.close),recent=closes.slice(-40),first=recent[0],last=recent[recent.length-1];
-        const changePct=((last-first)/first)*100;
-        const sliceForVol=candles.slice(-40);
-        const ranges=sliceForVol.map(c=>c.high-c.low);
-        const avgRange=ranges.reduce((a,b)=>a+b,0)/ranges.length;
-        const lastRange=ranges[ranges.length-1];
-        const volRatio=avgRange===0?1:lastRange/avgRange;
-        const rsi=data.indicators&&data.indicators.rsi?data.indicators.rsi:null;
-        const atrVal=data.indicators&&data.indicators.atr?data.indicators.atr:null;
-        const pair=data.pair_name||data.pair_code||"Pair";
-        const tf=data.timeframe||"1min";
-        let trendBadge="SIDEWAYS",badgeClass="ai-badge badge-sideways",trendText="",rsiText="",volText="",atrText="",eduText="";
-        if(changePct>0.6){trendBadge="UPTREND KUAT";badgeClass="ai-badge badge-up";trendText="Market "+pair+" pada "+tf+" sedang uptrend cukup kuat (+"+changePct.toFixed(2)+"% dalam ±40 candle).";}
-        else if(changePct>0.2){trendBadge="UPTREND RINGAN";badgeClass="ai-badge badge-up";trendText="Market cenderung bullish ringan. Arah naik ada tapi tidak terlalu agresif.";}
-        else if(changePct<-0.6){trendBadge="DOWNTREND KUAT";badgeClass="ai-badge badge-down";trendText="Market "+pair+" sedang downtrend kuat ("+Math.abs(changePct).toFixed(2)+"% turun dalam ±40 candle).";}
-        else if(changePct<-0.2){trendBadge="DOWNTREND RINGAN";badgeClass="ai-badge badge-down";trendText="Market cenderung bearish ringan. Tekanan turun ada.";}
-        else{trendBadge="SIDEWAYS";badgeClass="ai-badge badge-sideways";trendText="Market "+pair+" cenderung sideways / ranging.";}
-        if(rsi!==null){
-          if(rsi>70)rsiText=" RSI sekitar "+rsi.toFixed(1)+" (overbought). Waspada koreksi.";
-          else if(rsi<30)rsiText=" RSI sekitar "+rsi.toFixed(1)+" (oversold). Ada potensi bounce.";
-          else rsiText=" RSI sekitar "+rsi.toFixed(1)+" (zona netral).";
-        }
-        if(volRatio>1.5)volText=" Volatilitas di atas rata-rata, candle lebih panjang dari biasanya.";
-        else if(volRatio<0.7)volText=" Volatilitas rendah, candle kecil-kecil. Rawan fake signal.";
-        else volText=" Volatilitas normal, cocok untuk latihan membaca pola dengan tenang.";
-        if(atrVal!==null){
-          atrText=" ATR(14) sekitar "+atrVal.toFixed(5)+", gunakan sebagai gambaran range gerak normal per candle.";
-        }
-        if(trendBadge.includes("UPTREND"))eduText=" Latihan: fokus BUY di arah trend setelah koreksi, jangan kejar candle yang sudah sangat panjang.";
-        else if(trendBadge.includes("DOWNTREND"))eduText=" Latihan: fokus SELL setelah pullback gagal tembus resistance, hindari melawan trend.";
-        else eduText=" Latihan terbaik di sideways adalah belajar MENAHAN diri, tunggu breakout jelas.";
-        badgeEl.className=badgeClass;badgeEl.innerText=trendBadge;
-        aiTextEl.innerText=trendText+rsiText+volText+atrText+eduText;
-      }
 
-      function setupTimeframeButtons(){
-        const buttons=document.querySelectorAll(".tf-btn");
-        buttons.forEach(btn=>{
-          btn.addEventListener("click",()=>{
-            buttons.forEach(b=>b.classList.remove("active"));
-            btn.classList.add("active");
-            currentTF=btn.getAttribute("data-tf");
-            document.getElementById("tblTFView").innerText=currentTF+" (label tampilan)";
-            if(allCandles.length>0)drawFullHistory(document.getElementById("tblPair").innerText||currentPair);
+        document.getElementById("aiStatus").innerText = "Mengirim data ke AI, mohon tunggu...";
+        document.getElementById("aiText").innerText   = "";
+
+        try {
+          const tf = document.getElementById("tfSelect").value;
+          const res = await fetch("/ai_insight", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              pair: lastSnapshot.pair,
+              timeframe: tf,
+              signal: lastSnapshot.signal,
+              indicators: lastSnapshot.indicators,
+              structure: lastSnapshot.structure,
+              bos: lastSnapshot.bos,
+              pattern: lastSnapshot.pattern,
+              confluence: lastSnapshot.confluence
+            })
           });
-        });
-      }
 
-      function setupPairButtons(){
-        const buttons=document.querySelectorAll(".pair-btn");
-        buttons.forEach(btn=>{
-          btn.addEventListener("click",()=>{
-            buttons.forEach(b=>b.classList.remove("active"));
-            btn.classList.add("active");
-            currentPair=btn.getAttribute("data-pair");
-            ambilSignal(true);
-          });
-        });
-      }
-
-      function toggleAuto(){
-        autoOn=!autoOn;
-        const btn=document.getElementById("autoBtn");
-        const span = btn.querySelector("span:nth-child(2)");
-        if(autoOn){
-          btn.classList.add("on");
-          span.innerText="AUTO: ON";
-          autoTimer=setInterval(()=>ambilSignal(false),15000);
-        }else{
-          btn.classList.remove("on");
-          span.innerText="AUTO: OFF";
-          if(autoTimer)clearInterval(autoTimer);
+          const data = await res.json();
+          if (data.error) {
+            document.getElementById("aiStatus").innerText = "AI error: " + data.error;
+            document.getElementById("aiText").innerText   = data.details || "";
+          } else {
+            document.getElementById("aiStatus").innerText = "Penjelasan AI (untuk latihan, bukan sinyal pasti):";
+            document.getElementById("aiText").innerText   = data.ai_comment;
+          }
+        } catch (e) {
+          console.error(e);
+          document.getElementById("aiStatus").innerText = "Gagal menghubungi AI.";
+          document.getElementById("aiText").innerText   = e.message;
         }
       }
 
-      window.onload=()=>{setupTimeframeButtons();setupPairButtons();ambilSignal(true);};
+      function hitungRisk() {
+        const balance = parseFloat(document.getElementById("rmBalance").value || "0");
+        const riskPct = parseFloat(document.getElementById("rmRiskPct").value || "0");
+        const payout  = parseFloat(document.getElementById("rmPayout").value || "0");
+        const durasi  = document.getElementById("rmDuration").value;
+
+        if (balance <= 0 || riskPct <= 0 || payout <= 0) {
+          document.getElementById("rmAmount").innerText = "-";
+          document.getElementById("rmMaxLoss").innerText = "-";
+          document.getElementById("rmProfit").innerText = "-";
+          document.getElementById("rmTotalReturn").innerText = "-";
+          document.getElementById("rmNote").innerText = "Isi saldo, risk%, dan payout dengan benar dulu.";
+          return;
+        }
+
+        const amount    = balance * (riskPct / 100.0);
+        const maxLoss   = amount;
+        const profitWin = amount * (payout / 100.0);
+        const totalBack = amount + profitWin;
+
+        document.getElementById("rmAmount").innerText      = amount.toFixed(2);
+        document.getElementById("rmMaxLoss").innerText     = "-" + maxLoss.toFixed(2);
+        document.getElementById("rmProfit").innerText      = "+" + profitWin.toFixed(2);
+        document.getElementById("rmTotalReturn").innerText = totalBack.toFixed(2);
+
+        document.getElementById("rmNote").innerText =
+          "Simulasi: jika kamu entry " + durasi + " dengan amount " + amount.toFixed(2) +
+          ", kerugian maksimal per trade sekitar " + maxLoss.toFixed(2) +
+          " dan jika payout " + payout.toFixed(0) + "% maka profit sekitar " +
+          profitWin.toFixed(2) + " jika posisi menang. Gunakan ini untuk latihan risk management di akun demo, bukan jaminan hasil.";
+      }
+
+      // auto load pertama
+      ambilSignal();
     </script>
   </body>
   </html>
